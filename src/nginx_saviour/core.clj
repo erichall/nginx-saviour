@@ -273,6 +273,7 @@
   (spit (get-in (deref args-atom) [:banned-ip-file :value]) (str ip "\n") :append true))
 
 (defn write-ips-to-file-nginx-style!
+  "Spit all the banned ips to a file in a nginx way format"
   [ips]
   (let [ips (clojure.string/join " 1;\n " ips)]
     (spit (get-in (deref args-atom) [:banned-ip-file :value]) (str "geo $bad_ip {\n default 0;\n " ips " 1;\n}"))))
