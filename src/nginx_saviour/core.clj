@@ -108,24 +108,20 @@
 
 (def fields [:remote-addr :remote-user :time :request :status :body-bytes-sent :http-referer :http-user-agent :original])
 
-(s/conform string? nil)
-
 (defonce c (->> "config.edn" io/resource slurp edn/read-string))
 (defn get-config [] c)
 (def path-to-watch (:file-to-watch (get-config)))
 
 (defn abs [n] (max n (- n)))
 
-(concat [1 2 3] '(555 5))
-(list? '(1))
-
-
 (defn tail-process
   "Builder for that outputs a whole file then tails it and wait for new data in the file."
   [file-path]
-  (let [c ["tail" "-fn+1"]
-        cmd (if (seq? file-path) (concat c file-path) (conj c file-path))]
-    (ProcessBuilder. cmd)))
+  (if (every? exists? file-path)
+    (let [c ["tail" "-fn+1"]
+          cmd (if (seq? file-path) (concat c file-path) (conj c file-path))]
+      (ProcessBuilder. cmd))
+    (async/put! error-channel {:name :file-not-found :message (str "Unable to tail process - file not found " file-path)})))
 
 (defn start-process
   "Start a process."
@@ -247,9 +243,8 @@
                            parse-datetime))
           (assoc :original row)
           (assoc :request (parse-request (:request data)))))
-    (catch Exception e
-      ;; may be some strange row, atleast we can parse some rows and we should be able to get the ip
-      ;(log/error e)
+    (catch Exception _
+      ;; do nothing..
       )))
 
 (defn initiate-tail-process!
@@ -261,7 +256,7 @@
                              (if (vector? file-name) f full-path)
                              tail-process
                              start-process))
-      (async/put! error-channel {:name :file-not-found :message (str "Unable to find file " full-path)}))))
+      (print-exit (str "Unable to find file - " f)))))
 
 (defn banned?
   [log-row]
@@ -269,22 +264,46 @@
 
 (defn valid-referer?
   "Just allow https for now, maybe inform about this..."
-  [http-referer]
+  {:test (fn []
+           (is (= (valid-referer? "https://homepage.com" ["home.se" "homepage.com"]) true))
+           (is (= (valid-referer? "homepag" ["home.se" "homepage.com"]) false))
+           (is (= (valid-referer? "https://byggarn.erkanp.dev/static/57adca76/css/simple-page.theme.css" ["erkanp.dev" "byggarn.erkanp.dev"]) true)))}
+  [http-referer valid-refs]
   (boolean (some (fn [r]
                    (->
-                     (str "^https://" r "/?")
+                     (str "^(\"|')?https://" r "/?")
                      re-pattern
-                     (re-find http-referer)))
-                 (get-in (deref args-atom) [:valid-http-referers :value]))))
+                     (re-find http-referer)
+                     boolean)) valid-refs)))
 
+(re-find #"^/\.well-known/" "/.well-known/")
 (defn valid-url?
-  "Check if a url is valid, for now, the only valid is /"
+  "Check if a url is valid."
   [url]
-  (= url "/"))
+  (if (re-find #"^/\.well-known/" url)
+    true
+    (condp = url
+      "/" true
+      "/robots.txt" true
+      "/favicon.ico" true
+      "/sitemap.xml" true
+      ;; default
+      false
+      )))
 
 (defn should-ban?
-  [{:keys [http-referer request]}]
-  (or (valid-url? (:url request)) (valid-referer? http-referer)))
+  {:test (fn []
+           (is (= (should-ban? {:http-referer "https://byggarn.erkanp.dev/static/57adca76/css/simple-page.theme.css"
+                                :request      {:url "/asd"}}
+                               ["erkanp.dev" "byggarn.erkanp.dev"])
+                  false)))}
+  [{:keys [http-referer request]} valid-refs]
+  (let [ref-ok? (valid-referer? http-referer valid-refs)
+        url-ok? (valid-url? (:url request))]
+    (cond
+      ref-ok? false
+      url-ok? false
+      :else true)))
 
 (defn write-to-file!
   [ip]
@@ -301,13 +320,14 @@
   (async/go-loop []
     (let [data (async/<! message-channel)]
       (if (banned? data)
-        (do (log/debug (str data " is banned and should not show up here?!"))
+        (do (log/debug (str data " is banned and should not show up here"))
             (recur))
-        (let [data (parse-row data)]
+        (let [data (parse-row data)
+              valid-refs (get-in (deref args-atom) [:valid-http-referers :value])]
           (if (some? data)
             (do
-              (log/debug "Data..." (:remote-addr data))
-              (when (should-ban? data)
+              (when (should-ban? data valid-refs)
+                (log/debug "Ban - " (:remote-addr data) " | " (get-in data [:request :url]))
                 (swap! banned-ip-list-atom conj (:remote-addr data))
                 (write-ips-to-file-nginx-style! (deref banned-ip-list-atom))
                 (apply sh (->
@@ -383,18 +403,27 @@
 
   (destroy (deref process-atom))
 
-  (start-dir-watch {:path      path-to-watch
-                    :file-name "test.log"})
+  (let [args {"-f" ["test.log" "test1.log"]
+              "-p" "logs/"
+              "-b" "blacklist.ip"
+              "-r" ["erkanp.dev" "byggarn.erkanp.dev"]
+              "-n" "echo wasup"}]
+    (reset! args-atom (parse-args args (deref args-atom))))
 
-  (initiate-tail-process! ["test.log" "test1.log"])
-  (process-file!)
+  (let [file-name (get-in (deref args-atom) [:file-name :value])
+        path (get-in (deref args-atom) [:folder-path :value])]
+
+    (start-dir-watch {:path      path
+                      :file-name file-name})
+
+    (initiate-tail-process! file-name)
+
+    (process-file!))
 
   (destroy (deref process-atom))
 
   ;; superb!
   ;; https://www.initpals.com/nginx/how-to-block-requests-from-specific-ip-address-in-nginx/
-
-  (s/conform (s/coll-of string?) ["1" "2"])
 
   )
 
