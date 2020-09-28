@@ -204,6 +204,7 @@
       :else false)))
 
 (defn should-ban?
+  "Validate against urls and https-referer"
   {:test (fn []
            (is (= (should-ban? {:http-referer "https://byggarn.erkanp.dev/static/57adca76/css/simple-page.theme.css"
                                 :request      {:url "/asd"}}
