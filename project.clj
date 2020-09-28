@@ -10,13 +10,9 @@
                  [clojure-watch "0.1.14"]]
   :main ^:skip-aot nginx-saviour.core
   :target-path "target/%s"
-  :profiles {:dev     {:resource-paths ["config/dev"]
-                       :injections     [(println "including dev profile")]
-                       }
+  :profiles {
              :uberjar {
-                       :resource-paths ["config/release"]
-                       :aot            :all
-                       :injections     [(println "including prod profile")]
+                       :aot :all
                        }
              }
   )

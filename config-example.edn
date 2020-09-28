@@ -1,0 +1,24 @@
+{
+ ;; absolute path for files to watch
+ :files-to-watch       ["my-logs/logs/log-a.log" "my-logs/logs/log-b.log"]
+
+ ;; directory where the logs are being rotated, each file inside <files-to-watch> must be inside this folder
+ :log-rotate-directory "my-logs/logs/"
+
+ ;; file to output blacklisted ips
+ :blacklist-output     "banned-ips.txt"
+
+ ;; valid http referers, is https://..
+ :valid-https-referers ["homepage.com" "api.homepage.com"]
+
+ ;; how to restart nginx after outputting blacklisted ips to <blacklist-output>
+ ;; in ubuntu you can do systemctl restart nginx
+ :nginx-restart-cmd    "systemctl restart nginx"
+
+ ;; loglevel timbre logging - :trace :debug :info :warn :error :fatal :report
+ :log-level            :info
+
+ ;; valid urls with regex, not to ban
+ :valid-urls           {:urls  ["/" "/robots.txt" "/favicon.ico" "/sitemap.xml" "/api/ws/" "/api/v1/"]
+                        :regex ["^/\\.well-known/"]}
+ }

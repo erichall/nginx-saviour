@@ -2,15 +2,11 @@
   (:require [taoensso.timbre :as log]
             [clojure.java.io :as io]
             [clj-time.format :as f]
-            [clj-time.coerce :as coerce]
-            [clojure.edn :as edn]
-            [clojure.spec.alpha :as s]
             [clojure.test :refer [is]]
             [clojure.core.async :as async]
             [clojure-watch.core :refer [start-watch]]
             [clojure.java.shell :refer [sh]])
-  (:gen-class)
-  (:import (clojure.lang PersistentVector)))
+  (:gen-class))
 
 (defn exists?
   [file]
@@ -27,101 +23,25 @@
 (defonce banned-ip-list-atom (atom #{}))
 (defonce watch-atom (atom nil))
 (defonce process-atom (atom nil))
-(def initial-args-state {:folder-path         {:parse-fn (fn [x]
-                                                           (cond
-                                                             (not (s/conform string? x)) (print-exit (str x " is not a string"))
-                                                             (not (exists? x)) (print-exit (str x " does not exists."))
-                                                             (not (clojure.string/ends-with? x "/")) (print-exit (str x " does not end with /"))
-                                                             :else x)
-                                                           )
-                                               :type     String
-                                               :desc     "Path to the folder where the <file-name> is located in."
-                                               :key      ["-p" "--path"]
-                                               :value    nil}
-                         :file-name           {:parse-fn (fn [x]
-                                                           (cond
-                                                             (not (s/conform string? x)) (print-exit (str x " is not a string"))
-                                                             :else x))
-                                               :type     String
-                                               :desc     "Name of the file located inside <folder-path> can be one or multiple, must be inside same directory though!"
-                                               :key      ["-f" "--file"]
-                                               :value    nil}
-                         :banned-ip-file      {:parse-fn (fn [x]
-                                                           (cond
-                                                             :else x))
-                                               :type     String
-                                               :desc     "Name of the file to write blacklisted IPs to"
-                                               :key      ["-b" "--banned"]
-                                               :value    nil}
-                         :valid-http-referers {:parse-fn (fn [x]
-                                                           (cond
-                                                             (not (s/conform (s/coll-of string?) x)) (print-exit (str x " must be a list of strings"))
-                                                             :else x))
-                                               :type     PersistentVector
-                                               :desc     "Name of valid http referers myhomepage.com sub.myhomepage.com etc"
-                                               :key      ["-r" "--referers"]
-                                               :value    nil}
-                         :reload-nginx-cmd    {:parse-fn (fn [x]
-                                                           (cond
-                                                             (not (s/conform string? x)) (print-exit (str x " is not a string"))
-                                                             :else x))
-                                               :type     String
-                                               :desc     "Command for reloading nginx, ubuntu usually does it with systemctl reload nginx"
-                                               :key      ["-n" "--reload-nginx"]
-                                               :value    nil}
-                         })
+(defonce config-atom (atom nil))
 
-(defonce args-atom (atom nil))
-(when (nil? (deref args-atom))
-  (reset! args-atom initial-args-state))
+(defn get-config
+  [prop]
+  (get-in (deref config-atom) (if (vector? prop) prop [prop])))
 
 (defn in?
   "x is in xs?"
   [xs x]
   (some (fn [xx] (= x xx)) xs))
 
-(defn print-help
-  []
-  (println "\nnginx-saviour usage:\n")
-  (doseq [[_ {:keys [desc key]}] (deref args-atom)]
-    (println "\t" (clojure.string/join ", " key) "\t\t" desc))
-  (println "\t -h, --help" "\t\t" "Print this message"))
-
-(defn parse-args
-  [args args-state]
-  (if (not= (count (keys args)) (count (keys args-state)))
-    (do
-      (print-help)
-      (print-exit (str "Missing arguments: " args)))
-    (let [id-keys (->> (map vector (keys args-state) (map :key (vals args-state))) (into []))]
-      (reduce-kv (fn [args-state input-arg-key input-arg-val]
-                   (let [args-key (some (fn [[k keys]]
-                                          (when (in? keys input-arg-key)
-                                            k)) id-keys)]
-                     (if args-key
-                       (as->
-                         (get-in args-state [args-key :parse-fn]) $
-                         (apply $ [input-arg-val])
-                         (assoc-in args-state [args-key :value] $))
-                       (print-exit (str "Unable to find argument for " input-arg-key " with value " input-arg-val)))))
-                 args-state args))))
-
 (def fields [:remote-addr :remote-user :time :request :status :body-bytes-sent :http-referer :http-user-agent :original])
-
-(defonce c (->> "config.edn" io/resource slurp edn/read-string))
-(defn get-config [] c)
-(def path-to-watch (:file-to-watch (get-config)))
-
-(defn abs [n] (max n (- n)))
 
 (defn tail-process
   "Builder for that outputs a whole file then tails it and wait for new data in the file."
-  [file-path]
-  (if (every? exists? file-path)
-    (let [c ["tail" "-fn+1"]
-          cmd (if (seq? file-path) (concat c file-path) (conj c file-path))]
-      (ProcessBuilder. cmd))
-    (async/put! error-channel {:name :file-not-found :message (str "Unable to tail process - file not found " file-path)})))
+  [files-to-watch]
+  (if (every? exists? files-to-watch)
+    (ProcessBuilder. (concat ["tail" "-fn+1"] files-to-watch))
+    (print-exit (str "Files not found " files-to-watch))))
 
 (defn start-process
   "Start a process."
@@ -140,7 +60,8 @@
     (with-open [stdout (io/reader (.getInputStream (deref process-atom)))]
       (loop []
         (when-let [line (.readLine stdout)]
-          (async/>! message-channel line)
+          (when-not (or (empty? line) (nil? line))
+            (async/>! message-channel line))
           (recur))))))
 
 (defn remove-bracets
@@ -182,10 +103,6 @@
 (defn parse-datetime [timestamp]
   (f/parse (f/formatter *timestamp-format*) timestamp))
 
-(defn date-within?
-  [{:keys [d1 d2 millis-margin]}]
-  (>= (abs (- (coerce/to-long d2) (coerce/to-long d1))) millis-margin))
-
 (defn parse-request
   "Parse the request entry in a log row"
   {:test (fn []
@@ -210,9 +127,10 @@
              (is (= (get-ip row) "202.83.44.98"))
              (is (= (get-ip row2) nil))))}
   [row]
-  (->> row
-       (re-find #"^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})")
-       first))
+  (when-not (nil? row)
+    (->> row
+         (re-find #"^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})")
+         first)))
 
 (defn parse-row
   "excepts a default log row format
@@ -248,15 +166,13 @@
       )))
 
 (defn initiate-tail-process!
-  [file-name]
-  (let [full-path (str path-to-watch file-name)
-        f (map (fn [name] (str path-to-watch name)) file-name)]
-    (if (or (every? exists? f) (exists? full-path))
-      (reset! process-atom (->
-                             (if (vector? file-name) f full-path)
-                             tail-process
-                             start-process))
-      (print-exit (str "Unable to find file - " f)))))
+  [files-to-watch]
+  (if (every? exists? files-to-watch)
+    (reset! process-atom (->
+                           files-to-watch
+                           tail-process
+                           start-process))
+    (print-exit (str "Unable to find file - " files-to-watch))))
 
 (defn banned?
   [log-row]
@@ -268,28 +184,24 @@
            (is (= (valid-referer? "https://homepage.com" ["home.se" "homepage.com"]) true))
            (is (= (valid-referer? "homepag" ["home.se" "homepage.com"]) false))
            (is (= (valid-referer? "https://byggarn.erkanp.dev/static/57adca76/css/simple-page.theme.css" ["erkanp.dev" "byggarn.erkanp.dev"]) true)))}
-  [http-referer valid-refs]
+  [https-referer valid-refs]
   (boolean (some (fn [r]
                    (->
                      (str "^(\"|')?https://" r "/?")
                      re-pattern
-                     (re-find http-referer)
+                     (re-find https-referer)
                      boolean)) valid-refs)))
 
-(re-find #"^/\.well-known/" "/.well-known/")
 (defn valid-url?
   "Check if a url is valid."
   [url]
-  (if (re-find #"^/\.well-known/" url)
-    true
-    (condp = url
-      "/" true
-      "/robots.txt" true
-      "/favicon.ico" true
-      "/sitemap.xml" true
-      ;; default
-      false
-      )))
+  (let [valid-urls (get-config [:valid-urls :urls])
+        valid-regex (get-config [:valid-urls :regex])]
+    (cond
+      (nil? url) false
+      (in? valid-urls url) true
+      (boolean (some (fn [regex-str] (-> regex-str re-pattern (re-find url))) valid-regex)) true
+      :else false)))
 
 (defn should-ban?
   {:test (fn []
@@ -305,37 +217,32 @@
       url-ok? false
       :else true)))
 
-(defn write-to-file!
-  [ip]
-  (spit (get-in (deref args-atom) [:banned-ip-file :value]) (str ip "\n") :append true))
-
 (defn write-ips-to-file-nginx-style!
   "Spit all the banned ips to a file in a nginx way format"
   [ips]
   (let [ips (clojure.string/join " 1;\n " ips)]
-    (spit (get-in (deref args-atom) [:banned-ip-file :value]) (str "geo $bad_ip {\n default 0;\n " ips " 1;\n}"))))
+    (spit (get-config :blacklist-output) (str "geo $bad_ip {\n default 0;\n " ips " 1;\n}"))))
+
 
 (defn consume-log-rows-from-channel
   []
   (async/go-loop []
     (let [data (async/<! message-channel)]
       (if (banned? data)
-        (do (log/debug (str data " is banned and should not show up here"))
+        (do (log/info (str "Already banned |\t " (get-ip data)))
             (recur))
-        (let [data (parse-row data)
-              valid-refs (get-in (deref args-atom) [:valid-http-referers :value])]
-          (if (some? data)
-            (do
-              (when (should-ban? data valid-refs)
-                (log/debug "Ban - " (:remote-addr data) " | " (get-in data [:request :url]))
-                (swap! banned-ip-list-atom conj (:remote-addr data))
-                (write-ips-to-file-nginx-style! (deref banned-ip-list-atom))
-                (apply sh (->
-                            (deref args-atom)
-                            (get-in [:reload-nginx-cmd :value])
-                            (clojure.string/split #" ")
-                            (into [])))))
-            (log/debug "Ignore parsing: " data))
+        (let [d (parse-row data)
+              url (get-in d [:request :url])]
+          (if (some? d)
+            (when (should-ban? d (get-config :valid-https-referers))
+              (log/info "Ban \t\t|\t" (:remote-addr d) (if (nil? url) "" (str (clojure.string/join (repeat (- 20 (count (:remote-addr d))) " ")) " | " (subs url 0 (min 30 (count url))) "...")))
+              (swap! banned-ip-list-atom conj (:remote-addr d))
+              (write-ips-to-file-nginx-style! (deref banned-ip-list-atom))
+              (apply sh (->
+                          (get-config :nginx-restart-cmd)
+                          (clojure.string/split #" ")
+                          (into []))))
+            (log/info "Ignore parsing |\t" data))
           (recur))))))
 
 (defn process-file!
@@ -346,22 +253,21 @@
     (consume-log-rows-from-channel)))
 
 (defn restart-file-process!
-  [file-name]
+  [files-to-watch]
   (do
     (destroy (deref process-atom))
-    (initiate-tail-process! file-name)
+    (initiate-tail-process! files-to-watch)
     (process-file!)))
 
 (defn start-dir-watch
-  [{:keys [path file-name]}]
+  [{:keys [path files-to-watch]}]
   (reset! watch-atom (start-watch [{:path        path
                                     :event-types [:create]
                                     :callback    (fn [event filename]
                                                    (condp = event
                                                      ;; the log has rotated
-                                                     :create (when (or (= filename (str path file-name))
-                                                                       (and (vector? file-name) (in? (map (fn [f] (str path f)) file-name) filename)))
-                                                               (restart-file-process! file-name))
+                                                     :create (when (in? (map (fn [f] (str path f)) files-to-watch) filename)
+                                                               (restart-file-process! files-to-watch))
                                                      :delete nil
                                                      :modify nil)
                                                    )}])))
@@ -373,22 +279,6 @@
       deref
       (apply nil)))
 
-(defn args->hash-map
-  "List of args into a map where keys with multiple values ends up as a list.
-  throws if <args> does not contains an even number of values"
-  {:test (fn []
-           (is (= (args->hash-map '("-f" "ff" "-b" "bb" "-f" "fff")) {"-f" ["ff" "fff"] "-b" "bb"})))}
-  [args]
-  (when (not (even? (count args)))
-    (throw (Exception. "Missing arguments and values")))
-  (->>
-    (partition 2 args)
-    (reduce (fn [a [k v]]
-              (if (contains? a k)
-                (let [c (get a k)]
-                  (assoc a k (if (vector? c) (conj c v) [c v])))
-                (assoc a k v))) {})))
-
 (defn initialize-error-handling
   "Handle errors"
   []
@@ -396,29 +286,19 @@
     (let [{:keys [name message]} (async/<! error-channel)]
       (condp = name
         :file-not-found (print-exit message)
-        :unable-to-parse (log/debug message))
+        :unable-to-parse (log/error message))
       (recur))))
 
 (comment
 
   (destroy (deref process-atom))
 
-  (let [args {"-f" ["test.log" "test1.log"]
-              "-p" "logs/"
-              "-b" "blacklist.ip"
-              "-r" ["erkanp.dev" "byggarn.erkanp.dev"]
-              "-n" "echo wasup"}]
-    (reset! args-atom (parse-args args (deref args-atom))))
+  (start-dir-watch {:path      path
+                    :file-name file-name})
 
-  (let [file-name (get-in (deref args-atom) [:file-name :value])
-        path (get-in (deref args-atom) [:folder-path :value])]
+  (initiate-tail-process! file-name)
 
-    (start-dir-watch {:path      path
-                      :file-name file-name})
-
-    (initiate-tail-process! file-name)
-
-    (process-file!))
+  (process-file!)
 
   (destroy (deref process-atom))
 
@@ -431,29 +311,27 @@
   " I don't do a whole lot ... yet but something now!. "
   [& args]
 
-  (if (some (fn [x] (or (= x "--help") (= x "-h"))) args)
-    (do
-      (print-help)
-      (System/exit 0))
-    (reset! args-atom (-> args
-                          args->hash-map
-                          (parse-args (deref args-atom)))))
+  (let [conf (apply hash-map args)
+        config-file (get conf "--config")]
+    (if (and (nil? config-file) (not (exists? config-file)))
+      (print-exit (str "Unable to find config-file: " config-file " provide it with --config <file-name>.edn"))
+      (let [conf (-> (slurp config-file) clojure.edn/read-string)]
+        (reset! config-atom conf))))
 
+  ;; set log-level
+  (log/set-level! (get-config :log-level))
 
-  (let [file-name (get-in (deref args-atom) [:file-name :value])
-        path (get-in (deref args-atom) [:folder-path :value])]
+  ;; consume errors from error-channel
+  (initialize-error-handling)
 
-    ;; consume errors from error-channel
-    (initialize-error-handling)
+  ;; start to watch for changes in directory
+  (start-dir-watch {:path           (get-config :log-rotate-directory)
+                    :files-to-watch (get-config :files-to-watch)})
 
-    ;; start to watch for changes in directory
-    (start-dir-watch {:path      path
-                      :file-name file-name})
+  ;; start the tail process
+  (initiate-tail-process! (get-config :files-to-watch))
 
-    ;; start the tail process
-    (initiate-tail-process! file-name)
-
-    ;; start pub sub each row in the files
-    (process-file!)))
+  ;; start pub sub each row in the files
+  (process-file!))
 
 
