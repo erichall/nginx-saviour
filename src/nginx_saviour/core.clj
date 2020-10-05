@@ -187,9 +187,11 @@
   [{:keys [http-referer request remote-addr]} {:keys [valid-refs valid-ip-regex]}]
   (let [ref-ok? (valid-referer? http-referer valid-refs)
         url-ok? (valid-url? (:url request))
-        ip-ok? (-> (filter (partial valid-ip? remote-addr) valid-ip-regex)
-                   empty?
-                   not)]
+        ip-ok? (when (some? remote-addr)
+                 (-> (filter (partial valid-ip? (clojure.string/trim remote-addr)) valid-ip-regex)
+                     empty?
+                     not))]
+    (log/info (str "should not ban? (remote-addr, ref, url, ip, request) |\t" remote-addr "," ref-ok? "," url-ok? "," ip-ok? "," request))
     (cond
       ip-ok? false
       ref-ok? false
@@ -212,7 +214,8 @@
         (let [d (parse-row data)
               url (get-in d [:request :url])]
           (if (some? d)
-            (when (should-ban? d (get-config :valid-https-referers))
+            (when (should-ban? d {:valid-refs     (get-config :valid-https-referers)
+                                  :valid-ip-regex (get-config :valid-ip-regex)})
               (log/info "Ban \t\t|\t" (:remote-addr d) (if (nil? url) "" (str (clojure.string/join (repeat (- 20 (count (:remote-addr d))) " ")) " | " (subs url 0 (min 30 (count url))) "...")))
               (swap! banned-ip-list-atom conj (:remote-addr d))
               (write-ips-to-file-nginx-style! (deref banned-ip-list-atom))
@@ -241,25 +244,24 @@
   (reset! watch-atom (start-watch [{:path        path
                                     :event-types [:create :modify]
                                     :bootstrap   (fn [_]
+                                                   (log/info "Parsing files..")
                                                    (doseq [f files-to-watch]
-                                                     (read-lines f #(async/put! message-channel %))))
+                                                     (read-lines f #(async/go (async/>! message-channel %)))))
                                     :callback    (fn [event filename]
-                                                   (println "EVENT" event filename)
+                                                   (log/info "Directory event |\t " event filename)
                                                    (condp = event
                                                      ;; the log has rotated
                                                      :create (when (in? files-to-watch filename)
                                                                (doall
                                                                  (map (fn [line]
-                                                                        (async/put! message-channel line))
+                                                                        (async/go (async/>! message-channel line)))
                                                                       (tail-file! filename))))
                                                      :modify (when (in? files-to-watch filename)
                                                                (doall
                                                                  (map (fn [line]
-                                                                        (async/put! message-channel line))
+                                                                        (async/go (async/>! message-channel line)))
                                                                       (tail-file! filename))))
-
-                                                     :delete nil
-                                                     ))}])))
+                                                     :delete nil))}])))
 (defn stop-watch
   "Stop watching for directory changes."
   []
@@ -314,24 +316,17 @@
                 }
         ]
 
-    (reset! config-atom config)
-    )
+    (reset! config-atom config))
   (stop-watch)
+
   (start-dir-watch {:path           (get-config :log-rotate-directory)
                     :files-to-watch (get-config :files-to-watch)})
 
   (consume-log-rows-from-channel)
 
-  (start-dir-watch {:path      path
-                    :file-name file-name})
-
-  ;; superb!
-  ;; https://www.initpals.com/nginx/how-to-block-requests-from-specific-ip-address-in-nginx/
-
   )
 
 (defn -main
-  " I don't do a whole lot ... yet but something now!. "
   [& args]
 
   (let [conf (apply hash-map args)
@@ -347,12 +342,13 @@
   ;; consume errors from error-channel
   (initialize-error-handling)
 
-  ;; start to watch for changes in directory
+  ;; consume log data
+  (consume-log-rows-from-channel)
+
+  ;; start to watch for changes in directory and put data on message channel
   (start-dir-watch {:path           (get-config :log-rotate-directory)
                     :files-to-watch (get-config :files-to-watch)})
 
-  ;; consume log data
-  (consume-log-rows-from-channel)
   )
 
 
