@@ -22,7 +22,6 @@
 
 (defonce banned-ip-list-atom (atom #{}))
 (defonce watch-atom (atom nil))
-(defonce process-atom (atom nil))
 (defonce config-atom (atom nil))
 
 (defn get-config
@@ -35,34 +34,6 @@
   (some (fn [xx] (= x xx)) xs))
 
 (def fields [:remote-addr :remote-user :time :request :status :body-bytes-sent :http-referer :http-user-agent :original])
-
-(defn tail-process
-  "Builder for that outputs a whole file then tails it and wait for new data in the file."
-  [files-to-watch]
-  (if (every? exists? files-to-watch)
-    (ProcessBuilder. (concat ["tail" "-fn+1"] files-to-watch))
-    (print-exit (str "Files not found " files-to-watch))))
-
-(defn start-process
-  "Start a process."
-  [process]
-  (.start process))
-
-(defn destroy
-  "Destroy a process."
-  [process]
-  (.destroy process))
-
-(defn put-log-rows-on-channel
-  "Reads a async fil and put each line on a channel, requires a started process."
-  []
-  (async/go
-    (with-open [stdout (io/reader (.getInputStream (deref process-atom)))]
-      (loop []
-        (when-let [line (.readLine stdout)]
-          (when-not (or (empty? line) (nil? line))
-            (async/>! message-channel line))
-          (recur))))))
 
 (defn remove-bracets
   [s]
@@ -161,18 +132,9 @@
                            parse-datetime))
           (assoc :original row)
           (assoc :request (parse-request (:request data)))))
-    (catch Exception _
+    (catch Exception e
       ;; do nothing..
       )))
-
-(defn initiate-tail-process!
-  [files-to-watch]
-  (if (every? exists? files-to-watch)
-    (reset! process-atom (->
-                           files-to-watch
-                           tail-process
-                           start-process))
-    (print-exit (str "Unable to find file - " files-to-watch))))
 
 (defn banned?
   [log-row]
@@ -203,17 +165,33 @@
       (boolean (some (fn [regex-str] (-> regex-str re-pattern (re-find url))) valid-regex)) true
       :else false)))
 
+(defn valid-ip?
+  [ip regxp]
+  (-> (re-pattern regxp)
+      (re-matches ip)
+      boolean))
+
 (defn should-ban?
   "Validate against urls and https-referer"
   {:test (fn []
            (is (= (should-ban? {:http-referer "https://byggarn.erkanp.dev/static/57adca76/css/simple-page.theme.css"
                                 :request      {:url "/asd"}}
-                               ["erkanp.dev" "byggarn.erkanp.dev"])
-                  false)))}
-  [{:keys [http-referer request]} valid-refs]
+                               {:valid-refs ["erkanp.dev" "byggarn.erkanp.dev"]})
+                  false))
+           (is (= (should-ban? {:remote-addr "192.168.1.1"}
+                               {:valid-ip-regex ["(192)\\.(168)(\\.(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])){2}"]})
+                  false))
+           (is (= (should-ban? {:remote-addr "192.167.1.1"}
+                               {:valid-ip-regex ["(192)\\.(168)(\\.(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])){2}"]})
+                  true)))}
+  [{:keys [http-referer request remote-addr]} {:keys [valid-refs valid-ip-regex]}]
   (let [ref-ok? (valid-referer? http-referer valid-refs)
-        url-ok? (valid-url? (:url request))]
+        url-ok? (valid-url? (:url request))
+        ip-ok? (-> (filter (partial valid-ip? remote-addr) valid-ip-regex)
+                   empty?
+                   not)]
     (cond
+      ip-ok? false
       ref-ok? false
       url-ok? false
       :else true)))
@@ -223,7 +201,6 @@
   [ips]
   (let [ips (clojure.string/join " 1;\n " ips)]
     (spit (get-config :blacklist-output) (str "geo $bad_ip {\n default 0;\n " ips " 1;\n}"))))
-
 
 (defn consume-log-rows-from-channel
   []
@@ -246,33 +223,43 @@
             (log/info "Ignore parsing |\t" data))
           (recur))))))
 
-(defn process-file!
-  "Asynchronous process a file by putting new lines on a channel and operating on the client atom"
-  []
-  (do
-    (put-log-rows-on-channel)
-    (consume-log-rows-from-channel)))
+(defn read-lines
+  [file output-fn]
+  (with-open [reader (io/reader file)]
+    (doseq [line (line-seq reader)]
+      (output-fn line))))
 
-(defn restart-file-process!
-  [files-to-watch]
-  (do
-    (destroy (deref process-atom))
-    (initiate-tail-process! files-to-watch)
-    (process-file!)))
+(defn tail-file!
+  [file]
+  (->
+    (sh "tail" file)
+    :out
+    (clojure.string/split #"\n")))
 
 (defn start-dir-watch
   [{:keys [path files-to-watch]}]
   (reset! watch-atom (start-watch [{:path        path
-                                    :event-types [:create]
+                                    :event-types [:create :modify]
+                                    :bootstrap   (fn [_]
+                                                   (doseq [f files-to-watch]
+                                                     (read-lines f #(async/put! message-channel %))))
                                     :callback    (fn [event filename]
+                                                   (println "EVENT" event filename)
                                                    (condp = event
                                                      ;; the log has rotated
-                                                     :create (when (in? (map (fn [f] (str path f)) files-to-watch) filename)
-                                                               (restart-file-process! files-to-watch))
-                                                     :delete nil
-                                                     :modify nil)
-                                                   )}])))
+                                                     :create (when (in? files-to-watch filename)
+                                                               (doall
+                                                                 (map (fn [line]
+                                                                        (async/put! message-channel line))
+                                                                      (tail-file! filename))))
+                                                     :modify (when (in? files-to-watch filename)
+                                                               (doall
+                                                                 (map (fn [line]
+                                                                        (async/put! message-channel line))
+                                                                      (tail-file! filename))))
 
+                                                     :delete nil
+                                                     ))}])))
 (defn stop-watch
   "Stop watching for directory changes."
   []
@@ -292,16 +279,51 @@
 
 (comment
 
-  (destroy (deref process-atom))
+  (let [config {
+                ;; absolute path for files to watch
+                :files-to-watch       ["/Users/erkan/code/nginx-saviour/logs/test.log"
+                                       "/Users/erkan/code/nginx-saviour/logs/test1.log"]
+
+                ;; directory where the logs are being rotated, each file inside <files-to-watch> must be inside this folder
+                :log-rotate-directory "/Users/erkan/code/nginx-saviour/logs"
+
+                ;; file to output blacklisted ips
+                :blacklist-output     "blacklist.ip"
+
+                ;; valid http referers, is https://..
+                :valid-https-referers ["erkanp.dev" "byggarn.erkanp.dev"]
+
+                ;; how to restart nginx after outputting blacklisted ips to <blacklist-output>
+                :nginx-restart-cmd    "echo wohho"
+
+                ;; loglevel timbre logging - :trace :debug :info :warn :error :fatal :report
+                :log-level            :info
+
+                ;; valid urls with regex, not to ban
+                :valid-urls           {:urls  ["/" "/robots.txt" "/favicon.ico" "/sitemap.xml" "/api/ws/" "/api/v1/"]
+                                       :regex ["^/\\.well-known/"]}
+
+                :valid-ip-regex       [
+                                       ;; class A
+                                       "(10)(\\.([2]([0-5][0-5]|[01234][6-9])|[1][0-9][0-9]|[1-9][0-9]|[0-9])){3}"
+                                       ;; class B
+                                       "(172)\\.(1[6-9]|2[0-9]|3[0-1])(\\.(2[0-4][0-9]|25[0-5]|[1][0-9][0-9]|[1-9][0-9]|[0-9])){2}"
+                                       ;; class C
+                                       "(192)\\.(168)(\\.(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])){2}"
+                                       ]
+                }
+        ]
+
+    (reset! config-atom config)
+    )
+  (stop-watch)
+  (start-dir-watch {:path           (get-config :log-rotate-directory)
+                    :files-to-watch (get-config :files-to-watch)})
+
+  (consume-log-rows-from-channel)
 
   (start-dir-watch {:path      path
                     :file-name file-name})
-
-  (initiate-tail-process! file-name)
-
-  (process-file!)
-
-  (destroy (deref process-atom))
 
   ;; superb!
   ;; https://www.initpals.com/nginx/how-to-block-requests-from-specific-ip-address-in-nginx/
@@ -329,10 +351,8 @@
   (start-dir-watch {:path           (get-config :log-rotate-directory)
                     :files-to-watch (get-config :files-to-watch)})
 
-  ;; start the tail process
-  (initiate-tail-process! (get-config :files-to-watch))
-
-  ;; start pub sub each row in the files
-  (process-file!))
+  ;; consume log data
+  (consume-log-rows-from-channel)
+  )
 
 
