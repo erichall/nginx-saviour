@@ -191,7 +191,6 @@
                  (-> (filter (partial valid-ip? (clojure.string/trim remote-addr)) valid-ip-regex)
                      empty?
                      not))]
-    (log/info (str "should not ban? (remote-addr, ref, url, ip, request) |\t" remote-addr "," ref-ok? "," url-ok? "," ip-ok? "," request))
     (cond
       ip-ok? false
       ref-ok? false
@@ -322,9 +321,7 @@
   (start-dir-watch {:path           (get-config :log-rotate-directory)
                     :files-to-watch (get-config :files-to-watch)})
 
-  (consume-log-rows-from-channel)
-
-  )
+  (consume-log-rows-from-channel))
 
 (defn -main
   [& args]
